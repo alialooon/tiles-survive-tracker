@@ -175,7 +175,7 @@ class PlayerSearch:
         self.reader = None
         self.active = False
         self.hwnd = None
-        self.counts = {'captured': 0, 'processed': 0, 'found': 0, 'skipped': 0}
+        self.counts = {'captured': 0, 'processed': 0, 'found': 0, 'skipped': 0, 'texts': 0}
         self.output = None
         self._layout()
         self.root.after(160, self.poll)
@@ -230,7 +230,7 @@ class PlayerSearch:
             return
         self.hwnd = hwnd
         self.capture_stop.clear()
-        self.counts = {'captured': 0, 'processed': 0, 'found': 0, 'skipped': 0}
+        self.counts = {'captured': 0, 'processed': 0, 'found': 0, 'skipped': 0, 'texts': 0}
         self.pending = queue.Queue(maxsize=MAX_QUEUE)
         self.output = RESULTS / datetime.now().strftime('%Y%m%d_%H%M%S')
         self.output.mkdir(parents=True, exist_ok=True)
@@ -312,6 +312,7 @@ class PlayerSearch:
                         lines = ocr_lines(image, engine)
                         hits = player_hits(lines, name)
                         self.counts['processed'] += 1
+                        self.counts['texts'] += len(lines)
                         if hits:
                             self.save_hits(image, hits, timestamp, name)
                 finally:
@@ -371,7 +372,10 @@ class PlayerSearch:
         except queue.Empty:
             pass
         self.metrics.set(f"Кадров: {self.counts['captured']}   OCR: {self.counts['processed']}   "
-                         f"Очередь: {self.pending.qsize()}   Находок: {self.counts['found']}")
+                         f"Надписей: {self.counts['texts']}   Находок: {self.counts['found']}\n"
+                         f"Очередь: {self.pending.qsize()}   Пропущено: {self.counts['skipped']}")
+        if self.active and self.counts['processed'] >= 15 and self.counts['texts'] == 0:
+            self.status.set('OCR не видит надписей. Приблизьте карту на один шаг.')
         if self.active and self.pending.qsize() >= int(MAX_QUEUE * 0.8):
             self.status.set('Очередь почти заполнена. Замедлите прокрутку: OCR не успевает.')
         if not self.shutdown.is_set():
