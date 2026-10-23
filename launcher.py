@@ -396,12 +396,322 @@ class PlayerSearch:
         self.root.destroy()
 
 
+
+# --- Revision 10: strict nickname matching and verifiable visited coordinates ---
+import re
+import tkinter as tk
+from PIL import Image, ImageTk
+
+
+def strict_match_name(recognized: str, desired: str, confidence: float) -> tuple[bool, float]:
+    """Full-name matches only. Similar nicknames are never treated as hits."""
+    if confidence < 0.61 or len(normalize(desired)) < 4:
+        return False, 0.0
+    name = normalize(desired)
+    words = re.findall(r'[^\W_]+', unicodedata.normalize('NFKC', recognized), re.UNICODE)
+    tokens = [normalize(word) for word in words]
+    matched = name in tokens or ('mtt' + name) in tokens
+    return bool(matched), (1.0 if matched else 0.0)
+
+
+def parse_map_coordinates(raw: str, expected_state: str = '752') -> tuple[int, int] | None:
+    """Return observed center coordinates, not guessed location or map bounds."""
+    s = unicodedata.normalize('NFKC', raw).upper().replace('：', ':')
+    s = re.sub(r'\s+', ' ', s)
+    matched = re.search(r'X\s*[:=]?\s*(\d{1,5})\s*[,;\s]*Y\s*[:=]?\s*(\d{1,5})', s)
+    if matched is None:
+        return None
+    x, y = int(matched.group(1)), int(matched.group(2))
+    if 0 <= x <= 9999 and 0 <= y <= 9999:
+        return x, y
+    return None
+
+
+def extract_map_coordinates(image: np.ndarray, ocr, state: str) -> tuple[int, int] | None:
+    height, width = image.shape[:2]
+    if height < 250 or width < 450:
+        return None
+    header = image[0:min(44, height), int(width * .37):int(width * .74)]
+    if header.size == 0:
+        return None
+    big = cv2.resize(header, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    try:
+        output = ocr(big)
+        strings = getattr(output, 'txts', None)
+        return parse_map_coordinates(' '.join(map(str, strings)), state) if strings is not None else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+match_name = strict_match_name
+
+
+class PlayerSearchWithCoverage(PlayerSearch):
+    """Show last scanned screenshot and a real X/Y visitation trail."""
+    def __init__(self, root):
+        self.route_points = []
+        self.route_keys = set()
+        self.last_coord = None
+        self.preview_photo = None
+        self._preview_bgr = None
+        self.coverage_file = RESULTS / 'coverage_752.jsonl'
+        self._last_paint = 0.0
+        super().__init__(root)
+        self._load_coverage()
+        self._draw_route()
+
+    def _layout(self):
+        self.root.title('Tiles Survive Tracker — поиск и посещённые координаты')
+        self.root.geometry('1120x680')
+        self.root.minsize(760, 540)
+        outer = ttk.Frame(self.root, padding=12)
+        outer.pack(fill='both', expand=True)
+        ttk.Label(outer, text='Поиск поселения', font=('Segoe UI', 17, 'bold')).pack(anchor='w')
+        header = ttk.Frame(outer)
+        header.pack(fill='x', pady=(7, 7))
+        ttk.Label(header, text='Игрок').pack(side='left')
+        ttk.Entry(header, textvariable=self.target, width=23).pack(side='left', padx=(6, 18))
+        ttk.Label(header, text='Штат').pack(side='left')
+        ttk.Entry(header, textvariable=self.state, width=7).pack(side='left', padx=(6, 15))
+        self.go = ttk.Button(header, text='▶ Начать поиск', command=self.toggle)
+        self.go.pack(side='left', ipadx=10, ipady=7)
+        ttk.Button(header, text='Открыть находки', command=self.open_results).pack(side='left', padx=9)
+        ttk.Label(outer, textvariable=self.metrics, font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        panels = ttk.PanedWindow(outer, orient=tk.HORIZONTAL)
+        panels.pack(fill='both', expand=True, pady=9)
+        left, right = ttk.Frame(panels), ttk.Frame(panels)
+        panels.add(left, weight=3)
+        panels.add(right, weight=2)
+        ttk.Label(left, text='Последний видимый участок игры').pack(anchor='w')
+        self.preview_canvas = tk.Canvas(left, background='#1e2b32', highlightthickness=0)
+        self.preview_canvas.pack(fill='both', expand=True, pady=(4, 0))
+        self.preview_canvas.bind('<Configure>', lambda e: self._draw_preview())
+        ttk.Label(right, text='Посещённые центры X/Y (не полное покрытие)').pack(anchor='w')
+        self.route_canvas = tk.Canvas(right, background='#122b35', highlightthickness=0)
+        self.route_canvas.pack(fill='both', expand=True, pady=(4, 0))
+        self.route_canvas.bind('<Configure>', lambda e: self._draw_route())
+        self.coords_text = tk.StringVar(value='Координаты: пока не прочитаны')
+        ttk.Label(right, textvariable=self.coords_text, wraplength=380).pack(anchor='w', pady=5)
+        ttk.Label(outer, textvariable=self.status, wraplength=1000).pack(anchor='w', pady=(0, 5))
+        ttk.Label(outer, text='Точки на схеме — координаты кадров, прошедших OCR. '
+                  'Это маршрут центров, не доказательство проверки всех клеток. '
+                  'Для просмотра верните Tracker с панели задач.',
+                  foreground='#66747a', wraplength=1000).pack(anchor='w')
+
+    def _draw_preview(self):
+        if not hasattr(self, 'preview_canvas'):
+            return
+        canvas = self.preview_canvas
+        canvas.delete('all')
+        if self._preview_bgr is None:
+            canvas.create_text(max(100, canvas.winfo_width()//2),
+                               max(100, canvas.winfo_height()//2),
+                               text='Ожидание кадра игры', fill='white')
+            return
+        frame = self._preview_bgr
+        width, height = max(30, canvas.winfo_width()), max(30, canvas.winfo_height())
+        h, w = frame.shape[:2]
+        scale = min(width/w, height/h)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pic = Image.fromarray(rgb).resize((max(1, int(w*scale)), max(1, int(h*scale))),
+                                          Image.Resampling.BILINEAR)
+        self.preview_photo = ImageTk.PhotoImage(pic, master=self.root)
+        canvas.create_image(width//2, height//2, image=self.preview_photo)
+
+    def _load_coverage(self):
+        state = ''.join(c for c in self.state.get() if c.isdigit()) or '752'
+        self.coverage_file = RESULTS / ('coverage_' + state + '.jsonl')
+        if not self.coverage_file.exists():
+            return
+        try:
+            with self.coverage_file.open(encoding='utf-8') as lines:
+                for line in lines:
+                    record = json.loads(line)
+                    p = (int(record['x']), int(record['y']))
+                    if p not in self.route_keys:
+                        self.route_keys.add(p)
+                        self.route_points.append(p)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            log('Coverage read error: ' + repr(error))
+
+    def _record_visit(self, record):
+        try:
+            x, y = record['xy']
+            p = (int(x), int(y))
+        except (KeyError, ValueError, TypeError):
+            return
+        self.last_coord = p
+        self.coords_text.set(f'Центр обработанного кадра: X:{x} Y:{y}. '
+                             f'Уникальных координат: {len(self.route_keys)}')
+        if p in self.route_keys:
+            return
+        self.route_keys.add(p)
+        self.route_points.append(p)
+        try:
+            self.coverage_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.coverage_file.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps({'x':x, 'y':y,
+                                         'timestamp':record.get('ts')}) + '\n')
+        except OSError as error:
+            log('Coverage save error: ' + repr(error))
+        if time.monotonic() - self._last_paint > .4:
+            self._last_paint = time.monotonic()
+            self._draw_route()
+
+    def _draw_route(self):
+        if not hasattr(self, 'route_canvas'):
+            return
+        canvas = self.route_canvas
+        canvas.delete('all')
+        width, height = max(120, canvas.winfo_width()), max(100, canvas.winfo_height())
+        for i in range(1, 6):
+            canvas.create_line(14, height*i/6, width-14, height*i/6, fill='#29464d')
+            canvas.create_line(width*i/6, 12, width*i/6, height-12, fill='#29464d')
+        if not self.route_points:
+            canvas.create_text(width/2, height/2,
+                               text='Нет подтверждённых координат.\nНачните поиск.',
+                               fill='#cad5d8', justify='center')
+            return
+        xs, ys = zip(*self.route_points)
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        span_x, span_y = max(10, x1-x0), max(10, y1-y0)
+        def locate(p):
+            return (20+(p[0]-x0)/span_x*(width-40),
+                    20+(p[1]-y0)/span_y*(height-40))
+        for a, b in zip(self.route_points[:-1], self.route_points[1:]):
+            if abs(a[0]-b[0]) <= 75 and abs(a[1]-b[1]) <= 75:
+                ax, ay = locate(a)
+                bx, by = locate(b)
+                canvas.create_line(ax, ay, bx, by, fill='#3c9e8b', width=2)
+        for p in self.route_points[-3000:]:
+            x, y = locate(p)
+            canvas.create_oval(x-2.5, y-2.5, x+2.5, y+2.5, fill='#67e5ae', outline='')
+        x, y = locate(self.route_points[-1])
+        canvas.create_oval(x-7,y-7,x+7,y+7,fill='#ffd166',outline='#172f35',width=2)
+        canvas.create_text(8, 8, text=f'X:{x0}–{x1}, Y:{y0}–{y1}',
+                           fill='#d7e8ec', anchor='nw', font=('Segoe UI', 9))
+
+    def collect(self, hwnd):
+        try:
+            try:
+                from mss import MSS
+                provider = MSS()
+            except ImportError:
+                provider = None
+            previous, best, best_score = None, None, -1.
+            window_start, last_preview = time.monotonic(), 0.
+            while not self.capture_stop.is_set() and not self.shutdown.is_set():
+                t0 = time.monotonic()
+                frame = capture_visible_game(hwnd, provider)
+                if frame is not None:
+                    self.counts['captured'] += 1
+                    now = time.monotonic()
+                    if now - last_preview >= 1.0:
+                        success, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 68])
+                        if success:
+                            self.events.put(('preview', encoded.tobytes()))
+                        last_preview = now
+                    small = tiny_frame(frame)
+                    if sufficiently_new(small, previous):
+                        value = clarity(frame)
+                        if value > best_score:
+                            best, best_score = frame, value
+                        previous = small
+                    if now - window_start >= SAMPLE_EVERY:
+                        if best is not None:
+                            ok, enc = cv2.imencode('.jpg', best, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            if ok:
+                                try:
+                                    self.pending.put_nowait((now, enc.tobytes()))
+                                except queue.Full:
+                                    self.counts['skipped'] += 1
+                        best, best_score = None, -1.
+                        window_start = now
+                self.capture_stop.wait(max(.001, 1.0/FPS-(time.monotonic()-t0)))
+        except Exception as error:
+            log('Capture error: '+repr(error))
+            self.events.put(('error', 'Ошибка захвата: ' + str(error)))
+        finally:
+            self.capture_stop.set()
+            self.events.put(('capture_done', None))
+
+    def recognize(self, name):
+        try:
+            from rapidocr import RapidOCR
+            engine = RapidOCR()
+        except Exception as error:
+            self.events.put(('error', 'OCR не запускается: ' + str(error)))
+            self.capture_stop.set()
+            return
+        n = 0
+        try:
+            while not self.shutdown.is_set():
+                try:
+                    timestamp, encoded = self.pending.get(timeout=.4)
+                except queue.Empty:
+                    if self.capture_stop.is_set() and (not self.capturer or not self.capturer.is_alive()):
+                        break
+                    continue
+                try:
+                    image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8),
+                                         cv2.IMREAD_COLOR)
+                    if image is None:
+                        continue
+                    lines = ocr_lines(image, engine)
+                    lines = [line for line in lines
+                             if float(np.min(line[2][:,0])) >= image.shape[1] * .13]
+                    hits = player_hits(lines, name)
+                    self.counts['processed'] += 1
+                    self.counts['texts'] += len(lines)
+                    if hits:
+                        self.save_hits(image, hits, timestamp, name)
+                    n += 1
+                    if n % 3 == 0:
+                        xy = extract_map_coordinates(image, engine, self.state.get())
+                        if xy is not None:
+                            self.events.put(('coord', {'xy':xy, 'ts':timestamp}))
+                finally:
+                    self.pending.task_done()
+        except Exception as error:
+            log('OCR error: '+repr(error))
+            self.events.put(('error', 'Ошибка распознавания: ' + str(error)))
+            self.capture_stop.set()
+        finally:
+            self.events.put(('ocr_done', None))
+
+    def poll(self):
+        untouched = []
+        for _ in range(180):
+            try:
+                event, value = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if event == 'preview':
+                try:
+                    self._preview_bgr = cv2.imdecode(
+                        np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if self.root.state() != 'iconic':
+                        self._draw_preview()
+                except (ValueError, cv2.error):
+                    pass
+            elif event == 'coord':
+                self._record_visit(value)
+            else:
+                untouched.append((event, value))
+        for event in untouched:
+            self.events.put(event)
+        super().poll()
+
+
+
+
 def main():
     if sys.platform == 'win32':
         from windows_capture import set_dpi_awareness
         set_dpi_awareness()
     root = Tk()
-    app = PlayerSearch(root)
+    app = PlayerSearchWithCoverage(root)
     root.mainloop()
 
 
