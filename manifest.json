@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "revision": 8,
+  "revision": 9,
   "files": [
     {
       "path": "launcher.py",
-      "sha256": "39e32d1c1c855a60873a4c488b91c697c56107ce32d6413d5784f126a7f7afa4"
+      "sha256": "250fd54b1b1f7f15e3fe31d8c0c2b386f3c65f9d0bb69c36d41d241dce053a77"
     },
     {
       "path": "requirements.txt",
