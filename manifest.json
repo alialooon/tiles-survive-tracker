@@ -1,14 +1,10 @@
 {
   "schema": 1,
-  "revision": 2,
+  "revision": 3,
   "files": [
     {
       "path": "launcher.py",
-      "sha256": "83cd80b84d16b1e24bef6d1ae6f364689e6f4dec21d3710d58c0d9a4a8aff45b"
-    },
-    {
-      "path": "capture_hotfix.py",
-      "sha256": "f465b5dad19e59232a0e4d31b1050572f970e9b57ddf91c95a699563d5c538c0"
+      "sha256": "cacd97e23c9536b42d9019555d20ceb15060c879ac29f792701f0e27aac0187d"
     }
   ]
 }
