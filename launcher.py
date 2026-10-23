@@ -304,6 +304,252 @@ class SimpleTrackerApp(TrackerApp):
         self.root.after(150, self._poll)
 
 
+import re
+import difflib
+import cv2
+from datetime import datetime
+
+
+def _clean_player_name(value):
+    value = re.sub(r'^\s*\[[^\]]{1,12}\]\s*', '', str(value))
+    return re.sub(r'[^a-z0-9]', '', value.casefold())
+
+
+def _name_match(label, target):
+    """Compare OCR labels conservatively: exact first, then reviewable candidates."""
+    wanted = _clean_player_name(target)
+    seen = _clean_player_name(label)
+    if len(wanted) < 4 or not seen:
+        return False, 0.0
+    if wanted in seen:
+        return True, 1.0
+    if len(seen) < len(wanted) - 2:
+        return False, 0.0
+    ratio = difflib.SequenceMatcher(None, seen, wanted).ratio()
+    return ratio >= 0.84, ratio
+
+
+class PlayerFinderApp(SimpleTrackerApp):
+    """Read-only OCR search for a nickname on already-visible settlements.
+
+    A text hit is a candidate, NOT confirmed settlement ownership or map X/Y.
+    The map is moved only by the user, never by this application.
+    """
+    def _layout(self):
+        self.root.title('Tiles Survive Tracker — поиск игрока')
+        self.root.geometry('950x660')
+        self.root.minsize(700, 480)
+        opts = app.get_saved()
+        self.target_name = tk.StringVar(value=opts.get('player_search_name', 'KingBonbee'))
+        self.target_state = tk.StringVar(value=str(opts.get('player_search_state', '752')))
+        body = ttk.Frame(self.root, padding=16)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='Поиск поселения по имени',
+                  font=('Segoe UI', 18, 'bold')).pack(anchor='w')
+        ttk.Label(body, text='Штат и имя заданы. Tracker читает только видимую карту.',
+                  foreground='#61717a').pack(anchor='w', pady=(3, 12))
+        header = ttk.Frame(body)
+        header.pack(fill='x', pady=(0, 10))
+        ttk.Label(header, text='Игрок:').pack(side='left')
+        ttk.Entry(header, textvariable=self.target_name, width=24).pack(side='left', padx=(6, 18))
+        ttk.Label(header, text='Штат:').pack(side='left')
+        ttk.Entry(header, textvariable=self.target_state, width=6).pack(side='left', padx=6)
+        controls = ttk.Frame(body)
+        controls.pack(fill='x', pady=(0, 12))
+        self.go_btn = ttk.Button(controls, text='▶ Начать поиск', command=self.toggle_watch)
+        self.go_btn.pack(side='left', padx=(0, 8), ipadx=18, ipady=8)
+        ttk.Button(controls, text='Открыть находки', command=self.open_player_results).pack(
+            side='left', ipady=8)
+        self.counts_var = tk.StringVar(value='Просмотрено участков: 0   •   Совпадений: 0')
+        ttk.Label(body, textvariable=self.counts_var,
+                  font=('Segoe UI', 11, 'bold')).pack(anchor='w', pady=(0, 8))
+        self.canvas = tk.Canvas(body, background='#1b242a', highlightthickness=0)
+        self.canvas.pack(fill='both', expand=True)
+        self.canvas.bind('<Configure>', self._on_canvas_resize)
+        ttk.Label(body, textvariable=self.status_var, wraplength=850).pack(
+            anchor='w', pady=(8, 2))
+        ttk.Label(body, text='Совпадение с ником — только кандидат. Точные игровые X/Y требуют проверки.',
+                  foreground='#62717a').pack(anchor='w')
+        # Hidden storage widgets are required by the legacy history helpers.
+        self.window_box = ttk.Combobox(self.root, textvariable=self.window_var)
+        self.scan_box = ttk.Combobox(self.root, state='readonly')
+        self.table = ttk.Treeview(self.root,
+                                 columns=('num', 'x', 'y', 'score', 'status', 'player'))
+        self.log = tk.Text(self.root, height=1)
+        self.log.configure(state='disabled')
+
+    def toggle_watch(self):
+        if self.worker and self.worker.is_alive():
+            self.stop()
+            self.go_btn.configure(text='Останавливаю…', state='disabled')
+        else:
+            self.start_watch()
+
+    def _save_target(self):
+        name = self.target_name.get().strip()
+        state = self.target_state.get().strip()
+        if len(_clean_player_name(name)) < 4:
+            raise ValueError('Введите никнейм длиной не менее четырёх символов.')
+        if not state.isdigit() or int(state) < 1:
+            raise ValueError('Введите номер штата цифрами.')
+        config = app.get_saved()
+        config['player_search_name'] = name
+        config['player_search_state'] = state
+        app.SETTINGS_PATH.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+        return name, state
+
+    def start_watch(self):
+        if self.worker and self.worker.is_alive():
+            return
+        try:
+            name, state = self._save_target()
+        except ValueError as exc:
+            messagebox.showerror('Поиск игрока', str(exc))
+            return
+        if self.selected_hwnd is None:
+            self.refresh_windows()
+        if self.selected_hwnd is None:
+            messagebox.showinfo('Tiles Survive', 'Откройте карту игры и повторите поиск.')
+            return
+        hwnd = self.selected_hwnd
+        self.go_btn.configure(text='■ Остановить поиск', state='normal')
+        self.counts_var.set('Просмотрено участков: 0   •   Совпадений: 0')
+        self.log_message('Ищу ' + name + ' в штате #' + state +
+                         '. Перемещайте карту мышью, Tracker не управляет игрой.')
+
+        def work():
+            try:
+                from rapidocr import RapidOCR
+            except ImportError as exc:
+                raise RuntimeError(
+                    'Не установлено распознавание текста RapidOCR. '
+                    'Перезапустите start_windows.bat для установки зависимостей.'
+                ) from exc
+            ocr = RapidOCR()
+            fingerprints = []
+            reviewed = 0
+            errors = 0
+            while not self.stop_event.is_set():
+                try:
+                    frame = app.capture_window(hwnd)
+                    errors = 0
+                except Exception as exc:
+                    errors += 1
+                    if errors >= 5:
+                        raise RuntimeError('Не могу получить кадр игры: ' + str(exc)) from exc
+                    if self.stop_event.wait(3.0):
+                        break
+                    continue
+                h, w = frame.shape[:2]
+                if h < 200 or w < 400:
+                    raise RuntimeError('Слишком маленькое окно игры для поиска имени.')
+                from survey import fingerprint, similar_view
+                fp = fingerprint(frame)
+                if any(similar_view(fp, old, 4.0) for old in fingerprints):
+                    if self.stop_event.wait(3.5):
+                        break
+                    continue
+                fingerprints.append(fp)
+                if len(fingerprints) > 120:
+                    fingerprints.pop(0)
+                reviewed += 1
+                # Exclude fixed HUD and the chat bar; keep the building-name area.
+                x0, y0 = int(w * .025), int(h * .07)
+                x1, y1 = max(int(w * .7), w - 140), h - 125
+                region = frame[y0:y1, x0:x1]
+                scale = 1.7 if w <= 1900 else 1.2
+                enlarged = cv2.resize(region, None, fx=scale, fy=scale,
+                                       interpolation=cv2.INTER_CUBIC)
+                output = ocr(enlarged)
+                labels = list(getattr(output, 'txts', None) or ())
+                boxes = getattr(output, 'boxes', None)
+                confidences = getattr(output, 'scores', None)
+                for i, label in enumerate(labels):
+                    matched, similarity = _name_match(label, name)
+                    confidence = (float(confidences[i]) if confidences is not None
+                                  and i < len(confidences) else 0.0)
+                    if not matched or confidence < 0.45:
+                        continue
+                    if boxes is None or i >= len(boxes):
+                        continue
+                    points = boxes[i]
+                    coords = [(int(round(float(p[0]) / scale + x0)),
+                               int(round(float(p[1]) / scale + y0))) for p in points]
+                    if len(coords) < 4:
+                        continue
+                    annotated = frame.copy()
+                    poly = __import__('numpy').array(coords, dtype='int32')
+                    cv2.polylines(annotated, [poly], True, (0, 220, 255), 3)
+                    folder = app.DATA_DIR / 'player_matches'
+                    folder.mkdir(parents=True, exist_ok=True)
+                    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    name_safe = re.sub(r'[^a-zA-Z0-9_-]', '_', name)[:40]
+                    image_path = folder / (name_safe + '_state_' + state + '_' + stamp + '.png')
+                    app.save_image(image_path, annotated)
+                    metadata = {
+                        'target': name, 'state': state,
+                        'recognized_text': str(label),
+                        'ocr_confidence': confidence,
+                        'name_similarity': similarity,
+                        'screen_polygon': coords,
+                        'game_x': None, 'game_y': None,
+                        'status': 'candidate_needs_in_game_confirmation'
+                    }
+                    image_path.with_suffix('.json').write_text(
+                        json.dumps(metadata, ensure_ascii=False, indent=2),
+                        encoding='utf-8')
+                    self.events.put(('player_hit', (str(image_path), str(label), confidence)))
+                    self.stop_event.set()
+                    break
+                self.events.put(('player_progress', reviewed))
+                if self.stop_event.wait(3.5):
+                    break
+            self.events.put(('info', 'Поиск завершён. Результаты находятся в папке находок.'))
+
+        self.root.iconify()
+        self.root.after(650, lambda: self._run(work))
+
+    def open_player_results(self):
+        folder = app.DATA_DIR / 'player_matches'
+        folder.mkdir(parents=True, exist_ok=True)
+        if sys.platform == 'win32':
+            import os
+            os.startfile(str(folder))
+        else:
+            self.log_message('Папка результатов: ' + str(folder))
+
+    def _poll(self):
+        try:
+            while True:
+                tag, data = self.events.get_nowait()
+                if tag == 'player_progress':
+                    self.counts_var.set(f'Просмотрено участков: {data}   •   Совпадений: 0')
+                elif tag == 'player_hit':
+                    image_path, text, conf = data
+                    self.root.deiconify()
+                    self.root.lift()
+                    self.counts_var.set('Возможное совпадение найдено — требуется проверка!')
+                    self.current_image = load_image(image_path)
+                    self._show_image(self.current_image)
+                    self.log_message(f'Найдено похожее имя: {text} (OCR {conf:.0%}). '
+                                     'Точные координаты X/Y пока неизвестны.')
+                    messagebox.showinfo('Возможное совпадение',
+                                        'Похоже, найдено имя ' + text + '. '
+                                        'Проверьте поселение в игре и его координаты.')
+                elif tag == 'error':
+                    self.root.deiconify()
+                    self.log_message('Ошибка: ' + str(data))
+                    messagebox.showerror('Tracker', str(data))
+                elif tag == 'info':
+                    self.log_message(str(data))
+                elif tag == 'done':
+                    pass
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll)
+
+
 def run() -> int:
     if not (ROOT / 'app.py').is_file():
         print('ERROR: app.py is missing. Extract the full Tracker archive.', flush=True)
@@ -315,7 +561,7 @@ def run() -> int:
     import app
     wc.capture_window = capture_game
     app.capture_window = capture_game
-    app.TrackerApp = SimpleTrackerApp
+    app.TrackerApp = PlayerFinderApp
     app.main()
     return 0
 
