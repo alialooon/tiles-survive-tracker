@@ -16,7 +16,7 @@ function Say([string]$message) {
 }
 function SafeFile([string]$path) {
     $allowed = @("launcher.py", "updater.py", "app.py", "engine.py", "tracker.py",
-                 "survey.py", "windows_capture.py", "requirements.txt", "VERSION")
+                 "survey.py", "windows_capture.py", "capture_hotfix.py", "requirements.txt", "VERSION")
     return ($allowed -ccontains $path)
 }
 function Restore-Backup {
