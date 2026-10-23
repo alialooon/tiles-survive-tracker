@@ -67,6 +67,7 @@ try {
                 if ($actual -ne $checksum.ToUpperInvariant()) { throw "Update checksum mismatch: $name" }
             }
             New-Item -ItemType Directory -Force -Path $backup | Out-Null
+            $updated = $true
             foreach ($file in $files) {
                 $name = [string]$file.path
                 $dest = Join-Path $AppDir $name
