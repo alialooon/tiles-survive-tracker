@@ -41,8 +41,9 @@ try {
     }
 
     if ($null -ne $manifest) {
-        if ($manifest.schema -ne 1 -or $manifest.revision -isnot [int] -or
-            $manifest.revision -lt 1 -or $manifest.revision -gt 100000000) {
+        $remoteRev = 0
+        if (-not [int]::TryParse([string]$manifest.revision, [ref]$remoteRev) -or
+            $manifest.schema -ne 1 -or $remoteRev -lt 1 -or $remoteRev -gt 100000000) {
             throw "Invalid update manifest."
         }
         $installedRev = 0
@@ -50,7 +51,7 @@ try {
             [void][int]::TryParse((Get-Content -Raw $stamp).Trim(),
                                   [ref]$installedRev)
         }
-        if ([int]$manifest.revision -gt $installedRev) {
+        if ($remoteRev -gt $installedRev) {
             New-Item -ItemType Directory -Force -Path $stage | Out-Null
             $files = @($manifest.files)
             if ($files.Count -gt 20 -or $files.Count -eq 0) { throw "Invalid file count." }
