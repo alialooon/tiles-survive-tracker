@@ -214,7 +214,9 @@ class PlayerSearch:
             self.go.configure(text='▶ Начать поиск')
             self.status.set('Захват остановлен. Оставшиеся кадры проверяются в фоне.')
             return
-        if self.capturer and self.capturer.is_alive():
+        if ((self.capturer and self.capturer.is_alive()) or
+                (self.reader and self.reader.is_alive())):
+            self.status.set('Дождитесь завершения OCR и очереди перед новым запуском.')
             return
         name = self.target.get().strip()
         if len(normalize(name)) < 4:
