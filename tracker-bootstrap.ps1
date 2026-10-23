@@ -34,8 +34,9 @@ try {
     if (Test-Path -LiteralPath $stage) { Remove-Item $stage -Recurse -Force }
     if (Test-Path -LiteralPath $backup) { Remove-Item $backup -Recurse -Force }
     $manifest = $null
+    $cacheNonce = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     try {
-        $manifest = Invoke-RestMethod -Uri "$base/manifest.json" -TimeoutSec 15
+        $manifest = Invoke-RestMethod -Uri "${base}/manifest.json?rev=latest&cb=${cacheNonce}" -TimeoutSec 15
     } catch {
         Say "Update check unavailable. Launching installed version."
     }
@@ -62,7 +63,7 @@ try {
                     throw "Invalid update file or checksum: $name"
                 }
                 $dest = Join-Path $stage $name
-                Invoke-WebRequest -UseBasicParsing -Uri "$base/$name" -OutFile $dest -TimeoutSec 30
+                Invoke-WebRequest -UseBasicParsing -Uri "${base}/${name}?rev=${remoteRev}&cb=${cacheNonce}" -OutFile $dest -TimeoutSec 30
                 if ((Get-Item -LiteralPath $dest).Length -gt 1000000) { throw "Update file too large." }
                 $actual = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
                 if ($actual -ne $checksum.ToUpperInvariant()) { throw "Update checksum mismatch: $name" }
