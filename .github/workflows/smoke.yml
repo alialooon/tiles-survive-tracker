@@ -1,0 +1,38 @@
+name: Tracker smoke test
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax, checksums, matching
+        run: |
+          python - <<'PY'
+          import ast, json, hashlib, pathlib, difflib, re
+          src = pathlib.Path('launcher.py').read_text(encoding='utf-8')
+          compile(src, 'launcher.py', 'exec')
+          m = json.loads(pathlib.Path('manifest.json').read_text(encoding='utf-8'))
+          for item in m['files']:
+              path = pathlib.Path(item['path'])
+              assert path.name == item['path']
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == item['sha256']
+          tree = ast.parse(src)
+          funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name in ('_clean_player_name', '_name_match')]
+          assert len(funcs) == 2
+          scope = {'re': re, 'difflib': difflib}
+          exec(compile(ast.Module(body=funcs, type_ignores=[]), '<match>', 'exec'), scope)
+          cmp = scope['_name_match']
+          assert cmp('[YTR] KingBonbee', 'KingBonbee')[0]
+          assert cmp('KingBonbee', 'KingBonbee')[0]
+          assert not cmp('OtherPlayer', 'KingBonbee')[0]
+          print('Tracker smoke checks passed')
+          PY
