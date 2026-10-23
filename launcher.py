@@ -1,20 +1,24 @@
-"""Stable Windows launcher. The PowerShell bootstrap synchronizes verified GitHub updates first."""
+"""Start the GUI with the DirectX/Unity window-capture hotfix."""
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def run() -> int:
-    app = ROOT / "app.py"
-    if not app.is_file():
-        print("ERROR: app.py is missing. Extract the complete Tracker package.", flush=True)
+    if not (ROOT / 'app.py').is_file():
+        print('Missing app.py. Extract the complete Tracker installation.', flush=True)
         return 2
-    return subprocess.call([sys.executable, "-u", str(app)], cwd=str(ROOT))
+    from capture_hotfix import capture_window
+    import app
+    app.capture_window = capture_window
+    app.main()
+    return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(run())
