@@ -345,7 +345,8 @@ class PlayerSearch:
         cv2.imencode('.png', annotated)[1].tofile(str(file))
         with (self.output / 'candidates.jsonl').open('a', encoding='utf-8') as f:
             f.write(json.dumps({'target': name, 'state': self.state.get(),
-                                'file': file.name, 'hits': data}, ensure_ascii=False) + '\n')
+                                'file': file.name, 'camera_center_xy': getattr(self, 'candidate_xy', None),
+                                'hits': data}, ensure_ascii=False) + '\n')
         try:
             import winsound
             winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
@@ -664,13 +665,13 @@ class PlayerSearchWithCoverage(PlayerSearch):
                     hits = player_hits(lines, name)
                     self.counts['processed'] += 1
                     self.counts['texts'] += len(lines)
-                    if hits:
-                        self.save_hits(image, hits, timestamp, name)
                     n += 1
-                    if n % 3 == 0:
-                        xy = extract_map_coordinates(image, engine, self.state.get())
-                        if xy is not None:
-                            self.events.put(('coord', {'xy':xy, 'ts':timestamp}))
+                    xy = extract_map_coordinates(image, engine, self.state.get()) if (hits or n % 3 == 0) else None
+                    if xy is not None:
+                        self.events.put(('coord', {'xy':xy, 'ts':timestamp}))
+                    if hits:
+                        self.candidate_xy = list(xy) if xy is not None else None
+                        self.save_hits(image, hits, timestamp, name)
                 finally:
                     self.pending.task_done()
         except Exception as error:
