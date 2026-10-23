@@ -16,6 +16,24 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def _foreground_is_game(hwnd: int | None) -> bool:
+    """Win32 GetForegroundWindow can briefly return NULL (ctypes None).
+
+    Returning False is safe: we will try to activate the game again instead
+    of crashing when Windows is transitioning focus between two windows.
+    """
+    if hwnd is None or sys.platform != 'win32':
+        return False
+    try:
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        active = user32.GetForegroundWindow()
+        return active is not None and int(active) == int(hwnd)
+    except (OSError, AttributeError, ValueError, TypeError):
+        return False
+
+
 def _activate_game(hwnd: int) -> bool:
     """Best-effort foreground activation; never synthesize gameplay input."""
     if sys.platform != 'win32':
@@ -75,8 +93,11 @@ def run() -> int:
     if not (ROOT / 'app.py').is_file():
         print('ERROR: app.py is missing. Extract the full Tracker archive.', flush=True)
         return 2
-    import app
     import windows_capture as wc
+    # Replace the old unchecked int(GetForegroundWindow()) call before any
+    # capture: Win32 returns NULL during focus changes and ctypes maps it to None.
+    wc._game_is_foreground = _foreground_is_game
+    import app
     wc.capture_window = capture_game
     app.capture_window = capture_game
     app.main()
